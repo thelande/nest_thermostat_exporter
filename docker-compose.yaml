@@ -1,0 +1,11 @@
+version: "3"
+services:
+  nest_thermostat_exporter:
+    image: nest_thermostat_exporter
+    build: .
+    restart: always
+    volumes:
+      - ./client_secret.json:/var/secrets/client_secret.json
+      - ./.nest-metrics-credentials.json:/root/.nest-metrics-credentials.json
+    command: ["--config.client_secret", "/var/secrets/client_secret.json"]
+    network_mode: host
