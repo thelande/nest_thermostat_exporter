@@ -1,184 +1,205 @@
 # Copyright 2020 Thomas Helander
 # All rights reserved.
+from datetime import datetime, timedelta
 from pprint import pprint
-from . import constants
-from .parent import Parent
-
-
-class ThermostatEco(object):
-    def __init__(self, available_modes, cool_celsius, heat_celsius, mode):
-        self._available_modes = available_modes
-        self.cool_celsius = cool_celsius
-        self.heat_celsius = heat_celsius
-        self._mode = mode
-
-    @property
-    def available_modes(self):
-        return self._available_modes
-
-    @property
-    def mode(self):
-        return self._mode
-
-    @mode.setter
-    def mode(self, value):
-        if value not in self.available_modes:
-            raise ValueError(f"mode must be in {self.available_modes}")
-        self._mode = value
+from .constants import ENTERPRISE_NAME, THERMOSTAT_TYPE, TRAITS_PREFIX
+from .room import Room
+from .structure import Structure
+from .util import c_to_f
 
 
 class Thermostat(object):
-    def __init__(
-        self,
-        raw_data,
-        name,
-        parents,
-        connectivity_status,
-        fan_timer_mode,
-        ambient_humidity_percent,
-        custom_name,
-        temperature_scale,
-        ambient_temperature_celsius,
-        thermostat_eco,
-        thermostat_hvac_status,
-        thermostat_available_modes,
-        thermostat_mode,
-        thermostat_temperature_setpoint_cool_celsius,
-        thermostat_temperature_setpoint_heat_celsius,
-    ):
-        self._raw_data = raw_data
+    # Minimum allowed time between refreshes in seconds
+    REFRESH_LIMIT = timedelta(seconds=15)
+
+    def __init__(self, enterprise, name, parent_rels, traits):
+        self._enterprise = enterprise
+        self._structure = None
+        self._room = None
         self._name = name
-        self._parents = parents
-        self._connectivity_status = connectivity_status
-        self._fan_timer_mode = fan_timer_mode
-        self._ambient_humidity_percent = ambient_humidity_percent
-        self._custom_name = custom_name
-        self._temperature_scale = temperature_scale
-        self._ambient_temperature_celsius = ambient_temperature_celsius
-        self._thermostat_eco = thermostat_eco
-        self._thermostat_hvac_status = thermostat_hvac_status
-        self._thermostat_available_modes = thermostat_available_modes
-        self._thermostat_mode = thermostat_mode
-        self._thermostat_temperature_setpoint_cool_celsius = (
-            thermostat_temperature_setpoint_cool_celsius
-        )
-        self._thermostat_temperature_setpoint_heat_celsius = (
-            thermostat_temperature_setpoint_heat_celsius
-        )
+        self._traits = traits
+        self._last_refresh = None
+
+        self.set_parents(parent_rels)
 
     @classmethod
-    def from_resource(cls, r):
-        traits = r["traits"]
-        eco = ThermostatEco(
-            traits[constants.TRAITS_PREFIX + ".ThermostatEco"]["availableModes"],
-            traits[constants.TRAITS_PREFIX + ".ThermostatEco"]["coolCelsius"],
-            traits[constants.TRAITS_PREFIX + ".ThermostatEco"]["heatCelsius"],
-            traits[constants.TRAITS_PREFIX + ".ThermostatEco"]["mode"],
-        )
+    def get_thermostats(cls, enterprise):
+        resp = enterprise.devices().list(parent=ENTERPRISE_NAME).execute()
+        resources = resp.get("devices")
+        if resources is None:
+            raise ValueError("Invalid response: no devices key")
 
-        parents = []
-        for parent in r["parentRelations"]:
-            parents.append(Parent(parent["displayName"], parent["parent"]))
+        thermostats = []
+        for res in resources:
+            dev_type = res["type"]
+            if dev_type != THERMOSTAT_TYPE:
+                continue
 
-        return Thermostat(
-            r,
-            r["name"].split("/")[-1],
-            parents,
-            traits[constants.TRAITS_PREFIX + ".Connectivity"]["status"],
-            traits[constants.TRAITS_PREFIX + ".Fan"]["timerMode"],
-            traits[constants.TRAITS_PREFIX + ".Humidity"]["ambientHumidityPercent"],
-            traits[constants.TRAITS_PREFIX + ".Info"]["customName"],
-            traits[constants.TRAITS_PREFIX + ".Settings"]["temperatureScale"],
-            traits[constants.TRAITS_PREFIX + ".Temperature"][
-                "ambientTemperatureCelsius"
-            ],
-            eco,
-            traits[constants.TRAITS_PREFIX + ".ThermostatHvac"]["status"],
-            traits[constants.TRAITS_PREFIX + ".ThermostatMode"]["availableModes"],
-            traits[constants.TRAITS_PREFIX + ".ThermostatMode"]["mode"],
-            traits[constants.TRAITS_PREFIX + ".ThermostatTemperatureSetpoint"].get(
-                "coolCelsius"
-            ),
-            traits[constants.TRAITS_PREFIX + ".ThermostatTemperatureSetpoint"].get(
-                "heatCelsius"
-            ),
-        )
+            name = res["name"]
+            traits = res["traits"]
+            parent_rels = res["parentRelations"]
+            thermostats.append(Thermostat(enterprise, name, parent_rels, traits))
 
-    def running(self):
-        """
-        Returns True if the thermostat is currently running (heating, cooling, or fan
-        running).
+        return thermostats
 
-        :rtype: bool
-        """
-        return (
-            self.fan_timer_mode == constants.STATE_ON
-            or self.thermostat_mode != constants.STATE_OFF
-        )
+    def set_parents(self, parent_rels):
+        for rel in parent_rels:
+            name = rel["parent"]
+            display_name = rel["displayName"]
 
-    def dump(self):
-        """
-        Dumps this devices' raw data to the console.
-        """
-        pprint(self._raw_data)
+            if "room" in name:
+                # Is a room, get the room and structure
+                self._room = Room(name, display_name)
+
+                req = self._enterprise.structures().get(name=self._room.structure_name)
+                resp = req.execute()
+                self._structure = Structure(
+                    self._enterprise,
+                    resp["name"],
+                    resp["traits"]["sdm.structures.traits.Info"]["customName"],
+                )
+            elif "structure" in name:
+                # Is a structure
+                self._structure = Structure(self._enterprise, name, display_name)
+            else:
+                raise ValueError("parent is neither structure nor room")
+
+    def refresh_traits(self):
+        if (
+            self._last_refresh is None
+            or self._last_refresh + self.REFRESH_LIMIT < datetime.now()
+        ):
+            resp = self._enterprise.devices().get(name=self.name).execute()
+            self._traits = resp["traits"]
+            self._last_refresh = datetime.now()
+
+    def _get_trait_value(self, trait, key, default=None):
+        return self._traits[TRAITS_PREFIX + "." + trait].get(key, default)
+
+    def dump_traits(self):
+        pprint(self._traits)
 
     def __repr__(self):
-        return "<{}(parent={}, name={})>".format(
-            self.__class__.__name__, self.parent, self.name
+        return "<{}(structure={}, room={}, name={})>".format(
+            self.__class__.__name__,
+            self.structure.custom_name if self.structure else None,
+            self.room.display_name if self.room else None,
+            self.name,
         )
+
+    @property
+    def room(self):
+        return self._room
+
+    @property
+    def structure(self):
+        return self._structure
 
     @property
     def name(self):
         return self._name
 
     @property
-    def parent(self):
-        return self._parents[0]
-
-    @property
     def connectivity_status(self):
-        return self._connectivity_status
+        self.refresh_traits()
+        return self._get_trait_value("Connectivity", "status")
 
     @property
     def fan_timer_mode(self):
-        return self._fan_timer_mode
+        self.refresh_traits()
+        return self._get_trait_value("Fan", "timerMode")
+
+    @property
+    def fan_timer_timeout(self):
+        self.refresh_traits()
+        return self._get_trait_value("Fan", "timerTimeout")
 
     @property
     def ambient_humidity_percent(self):
-        return self._ambient_humidity_percent
+        self.refresh_traits()
+        return self._get_trait_value("Humidity", "ambientHumidityPercent")
 
     @property
     def custom_name(self):
-        return self._custom_name
+        self.refresh_traits()
+        return self._get_trait_value("Info", "customName")
 
     @property
     def temperature_scale(self):
-        return self._temperature_scale
+        self.refresh_traits()
+        return self._get_trait_value("Settings", "temperatureScale")
 
     @property
     def ambient_temperature_celsius(self):
-        return self._ambient_temperature_celsius
+        self.refresh_traits()
+        return self._get_trait_value("Temperature", "ambientTemperatureCelsius")
 
     @property
-    def thermostat_eco(self):
-        return self._thermostat_eco
+    def ambient_temperature_fahrenheit(self):
+        self.refresh_traits()
+        return c_to_f(self.ambient_temperature_celsius)
 
     @property
-    def thermostat_hvac_status(self):
-        return self._thermostat_hvac_status
+    def eco_available_modes(self):
+        self.refresh_traits()
+        return self._get_trait_value("ThermostatEco", "availableModes")
 
     @property
-    def thermostat_available_modes(self):
-        return self._thermostat_available_modes
+    def eco_current_modes(self):
+        self.refresh_traits()
+        return self._get_trait_value("ThermostatEco", "mode")
 
     @property
-    def thermostat_mode(self):
-        return self._thermostat_mode
+    def eco_heat_celsius(self):
+        self.refresh_traits()
+        return self._get_trait_value("ThermostatEco", "heatCelsius", "NaN")
 
     @property
-    def setpoint_cool_celsius(self):
-        return self._thermostat_temperature_setpoint_cool_celsius
+    def eco_heat_fahrenheit(self):
+        return c_to_f(self.eco_heat_celsius)
+
+    @property
+    def eco_cool_celsius(self):
+        self.refresh_traits()
+        return self._get_trait_value("ThermostatEco", "coolCelsius", "NaN")
+
+    @property
+    def eco_cool_fahrenheit(self):
+        return c_to_f(self.eco_cool_celsius)
+
+    @property
+    def hvac_status(self):
+        self.refresh_traits()
+        return self._get_trait_value("ThermostatHvac", "status")
+
+    @property
+    def available_modes(self):
+        self.refresh_traits()
+        return self._get_trait_value("ThermostatMode", "availableModes")
+
+    @property
+    def current_mode(self):
+        self.refresh_traits()
+        return self._get_trait_value("ThermostatMode", "mode")
 
     @property
     def setpoint_heat_celsius(self):
-        return self._thermostat_temperature_setpoint_heat_celsius
+        self.refresh_traits()
+        return self._get_trait_value(
+            "ThermostatTemperatureSetpoint", "heatCelsius", "NaN"
+        )
+
+    @property
+    def setpoint_heat_fahrenheit(self):
+        return c_to_f(self.setpoint_heat_celsius)
+
+    @property
+    def setpoint_cool_celsius(self):
+        self.refresh_traits()
+        return self._get_trait_value(
+            "ThermostatTemperatureSetpoint", "coolCelsius", "NaN"
+        )
+
+    @property
+    def setpoint_cool_fahrenheit(self):
+        return c_to_f(self.setpoint_cool_celsius)

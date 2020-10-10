@@ -2,112 +2,90 @@
 # All rights reserved.
 import click
 import sys
-from datetime import datetime, timedelta
-from functools import partial
+from enum import IntEnum
 from oauthlib.oauth2.rfc6749.errors import InvalidGrantError
-from prometheus_client import make_wsgi_app, Gauge
+from prometheus_client import make_wsgi_app
 from wsgiref.simple_server import make_server
 from .auth import get_authenticated_service
 from .thermostat import Thermostat
+from .util import make_metric
 
-METRIC_PREFIX = "nest_thermostat"
-PROJECT_ID = "a88b302d-d075-401f-90ec-7d911ce301c9"
+METRIC_G_CONNECTIVITY_STATUS = make_metric(
+    "gauge", "connectivity_status", "Connectivity status"
+)
 
-THERMOSTAT_TYPE = "sdm.devices.types.THERMOSTAT"
+METRIC_G_TEMPERATURE = make_metric(
+    "gauge", "ambient_temperature_celsius", "Ambient temperature"
+)
 
-DEVICE_CACHE = {}
-CACHE_SECONDS = 15
+METRIC_G_ECO_COOL_SETPOINT = make_metric(
+    "gauge", "eco_cool_setpoint_celsius", "Eco mode cooling setpoint"
+)
 
-METRIC_LABELS = ["location", "device_id"]
-
-
-def _get_device_from_cache(device_id):
-    if device_id in DEVICE_CACHE:
-        if DEVICE_CACHE[device_id]["expires_at"] > datetime.now():
-            return DEVICE_CACHE[device_id]["device"]
-        DEVICE_CACHE.pop(device_id)
-    return None
-
-
-def _add_device_to_cache(device):
-    DEVICE_CACHE[device.name] = {
-        "device": device,
-        "expires_at": datetime.now() + timedelta(seconds=CACHE_SECONDS),
-    }
-    # print(f"Added {device.name} to cache for {CACHE_SECONDS} seconds.")
+METRIC_G_ECO_HEAT_SETPOINT = make_metric(
+    "gauge", "eco_heat_setpoint_celsius", "Eco mode heating setpoint"
+)
+METRIC_G_COOL_SETPOINT = make_metric(
+    "gauge", "cool_setpoint_celsius", "Cooling setpoint"
+)
+METRIC_G_HEAT_SETPOINT = make_metric(
+    "gauge", "heat_setpoint_celsius", "Heating setpoint"
+)
+METRIC_G_HVAC_MODE = make_metric("gauge", "hvac_mode", "HVAC mode")
+METRIC_G_HVAC_STATUS = make_metric("gauge", "hvac_status", "current HVAC status")
 
 
-def _get_devices(service):
-    return (
-        service.devices()
-        .list(parent=f"enterprises/{PROJECT_ID}")
-        .execute()
-        .get("devices")
+class Modes(IntEnum):
+    OFF = 0
+    HEAT = 1
+    COOL = 2
+    HEATCOOL = 3
+
+    @classmethod
+    def get_value(cls, s):
+        if s == "OFF":
+            return cls.OFF
+        elif s == "HEAT" or s == "HEATING":
+            return cls.HEAT
+        elif s == "COOL" or s == "COOLING":
+            return cls.COOL
+        elif s == "HEATCOOL":
+            return cls.HEATCOOL
+        else:
+            raise ValueError(f"Unknown mode: {s}")
+
+
+def set_callbacks_for_thermostat(thermostat):
+    labels = (
+        thermostat.structure.custom_name,
+        thermostat.room.display_name,
+        thermostat.name,
     )
 
-
-def _get_thermostats(service):
-    devices = _get_devices(service)
-    # pp.pprint(devices)
-    return [
-        Thermostat.from_resource(dev)
-        for dev in devices
-        if dev["type"] == THERMOSTAT_TYPE
-    ]
-
-
-def _get_thermostat(service, device_id):
-    device = _get_device_from_cache(device_id)
-    if device is None:
-        # print(f"Thermostat {device_id} not in cache, fetching...")
-        resp = (
-            service.devices()
-            .get(name=f"enterprises/{PROJECT_ID}/devices/{device_id}")
-            .execute()
-        )
-        device = Thermostat.from_resource(resp)
-        _add_device_to_cache(device)
-    return device
-
-
-def _get_temperature_celsius(service, device_id):
-    device = _get_thermostat(service, device_id)
-    return device.ambient_temperature_celsius
-
-
-def _get_eco_cool_celsius(service, device_id):
-    device = _get_thermostat(service, device_id)
-    return device.thermostat_eco.cool_celsius
-
-
-def _get_eco_heat_celsius(service, device_id):
-    device = _get_thermostat(service, device_id)
-    return device.thermostat_eco.heat_celsius
-
-
-def _get_setpoint_cool_celsius(service, device_id):
-    device = _get_thermostat(service, device_id)
-    return device.setpoint_cool_celsius or 0
-
-
-def _get_setpoint_heat_celsius(service, device_id):
-    device = _get_thermostat(service, device_id)
-    return device.setpoint_heat_celsius or 0
-
-
-def _get_humidity(service, device_id):
-    device = _get_thermostat(service, device_id)
-    return device.ambient_humidity_percent
-
-
-def _get_connectivity(service, device_id):
-    device = _get_thermostat(service, device_id)
-    return 1 if device.connectivity_status else 0
-
-
-def _get_running(service, device_id):
-    device = _get_thermostat(service, device_id)
-    return 1 if device.running else 0
+    METRIC_G_CONNECTIVITY_STATUS.labels(*labels).set_function(
+        lambda: thermostat.connectivity_status == "ONLINE"
+    )
+    METRIC_G_HVAC_MODE.labels(*labels).set_function(
+        lambda: Modes.get_value(thermostat.current_mode)
+    )
+    METRIC_G_ECO_COOL_SETPOINT.labels(*labels).set_function(
+        lambda: thermostat.eco_cool_celsius
+    )
+    METRIC_G_ECO_HEAT_SETPOINT.labels(*labels).set_function(
+        lambda: thermostat.eco_heat_celsius
+    )
+    METRIC_G_COOL_SETPOINT.labels(*labels).set_function(
+        lambda: thermostat.setpoint_cool_celsius
+    )
+    METRIC_G_HEAT_SETPOINT.labels(*labels).set_function(
+        lambda: thermostat.setpoint_heat_celsius
+    )
+    METRIC_G_TEMPERATURE.labels(*labels).set_function(
+        lambda: thermostat.ambient_temperature_celsius
+    )
+    METRIC_G_HVAC_STATUS.labels(*labels).set_function(
+        lambda: Modes.get_value(thermostat.hvac_status)
+    )
 
 
 @click.command()
@@ -129,70 +107,14 @@ def main(listen_address, client_secret):
     addr, port = listen_address.split(":")
 
     try:
-        service = get_authenticated_service(client_secret)
+        enterprise = get_authenticated_service(client_secret)
     except InvalidGrantError:
         click.echo("Invalid authorization code", file=sys.stderr)
         sys.exit(1)
 
-    devices = _get_thermostats(service)
-
-    # Set up metrics
-    g_temp = Gauge(METRIC_PREFIX + "_temperature_celsius", "Temperature", METRIC_LABELS)
-    g_eco_cool = Gauge(METRIC_PREFIX + "_eco_cool_celsius", "Eco mode cooling temperature", METRIC_LABELS)
-    g_eco_heat = Gauge(METRIC_PREFIX + "_eco_heat_celsius", "Eco mode heating temperature", METRIC_LABELS)
-    g_setpoint_cool = Gauge(METRIC_PREFIX + "_setpoint_cool_celsius", "Cooling setpoint temperatures", METRIC_LABELS)
-    g_setpoint_heat = Gauge(METRIC_PREFIX + "_setpoint_heat_celsius",
-                            "Heating setpoint temperatures", METRIC_LABELS)
-    g_hum = Gauge(
-        METRIC_PREFIX + "_humidity_percent", "Relative humidity", METRIC_LABELS,
-    )
-    g_connectivity = Gauge(
-        METRIC_PREFIX + "_connectivity_state",
-        "Current connectivity state",
-        METRIC_LABELS,
-    )
-    # g_running = Gauge(
-    #     METRIC_PREFIX + "_running_state",
-    #     "Is the system currently cooling, heating, or running the fan?",
-    #     METRIC_LABELS
-    # )
-
-    # Set up callbacks
-    for dev in devices:
-        location = dev.parent.display_name
-        device_id = dev.name
-
-        g_temp.labels(location, device_id).set_function(
-            partial(_get_temperature_celsius, service, device_id)
-        )
-
-        g_eco_cool.labels(location, device_id).set_function(
-            partial(_get_eco_cool_celsius, service, device_id)
-        )
-
-        g_eco_heat.labels(location, device_id).set_function(
-            partial(_get_eco_heat_celsius, service, device_id)
-        )
-
-        g_setpoint_cool.labels(location, device_id).set_function(
-            partial(_get_setpoint_cool_celsius, service, device_id)
-        )
-
-        g_setpoint_heat.labels(location, device_id).set_function(
-            partial(_get_setpoint_heat_celsius, service, device_id)
-        )
-
-        g_hum.labels(location, device_id).set_function(
-            partial(_get_humidity, service, device_id)
-        )
-
-        g_connectivity.labels(location, device_id).set_function(
-            partial(_get_connectivity, service, device_id)
-        )
-
-        # g_running.labels(location, device_id).set_function(
-        #     partial(_get_running, service, device_id)
-        # )
+    thermostats = Thermostat.get_thermostats(enterprise)
+    for thermostat in thermostats:
+        set_callbacks_for_thermostat(thermostat)
 
     app = make_wsgi_app()
     httpd = make_server(addr, int(port), app)
