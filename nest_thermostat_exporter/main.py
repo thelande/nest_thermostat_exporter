@@ -18,6 +18,10 @@ METRIC_G_TEMPERATURE = make_metric(
     "gauge", "ambient_temperature_celsius", "Ambient temperature"
 )
 
+METRIC_G_HUMIDITY = make_metric(
+    "gauge", "ambient_humidity_percent", "Ambient relative humidity"
+)
+
 METRIC_G_ECO_COOL_SETPOINT = make_metric(
     "gauge", "eco_cool_setpoint_celsius", "Eco mode cooling setpoint"
 )
@@ -82,6 +86,9 @@ def set_callbacks_for_thermostat(thermostat):
     )
     METRIC_G_TEMPERATURE.labels(*labels).set_function(
         lambda: thermostat.ambient_temperature_celsius
+    )
+    METRIC_G_HUMIDITY.labels(*labels).set_function(
+        lambda: thermostat.ambient_humidity_percent
     )
     METRIC_G_HVAC_STATUS.labels(*labels).set_function(
         lambda: Modes.get_value(thermostat.hvac_status)
